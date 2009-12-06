@@ -2,8 +2,9 @@
 use App::Pm2Port;
 
 die "Usage: $0 Module::Name" unless @ARGV;
+my $a = App::Pm2Port->new( module => $ARGV[0] );
 
-App::Pm2Port->run;
+$a->run;
 
 =head1 NAME
 

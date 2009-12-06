@@ -1,4 +1,5 @@
 package App::Pm2Port;
+
 #===============================================================================
 #
 #         FILE:  portupload.pl
@@ -28,18 +29,21 @@ use Net::FTP;
 use Getopt::Long;
 use File::Temp qw(tempdir);
 use YAML qw(LoadFile DumpFile);
+use JSON::XS;
 use version;
 use CPAN;
 use CPANPLUS::Backend;
-
+use FreeBSD::Ports::INDEXhash qw/INDEXhash/;
 
 =head2 new
 
 =cut
 
 sub new {
-    my $class = shift;
-    bless {}, $class;
+    my $class  = shift;
+    my %params = @_;
+    $params{INDEX} = { INDEXhash() };
+    bless {%params}, $class;
 }
 
 =head2 prompt
@@ -65,7 +69,7 @@ Converts perl version number to something understandable by FreeBSD
 
 sub perl_version_parse {
     my ( $self, $version ) = @_;
-    my $b       = 0;
+    my $b = 0;
     return join '.', map { int $_ }
       grep { defined }
       ( $version =~ /^(\d+)\.(\d{1,3})(?:\.(\d{1,3})|(\d{3}))?$/ );
@@ -78,6 +82,7 @@ Returns FreeBSD-style list of dependencies.
 =cut
 
 sub get_dependencies {
+    my $self = shift;
     my $requires = shift;
     my $ports    = shift;
     return '' unless $requires;
@@ -105,14 +110,22 @@ sub get_dependencies {
         }
         next if $deps{$distribution};
         $deps{$distribution} = 1;
-        my $location =
-          `find /usr/ports -name $distribution -maxdepth 2|grep -v distfiles|head -n1`;
-        chomp $location;
-        unless ( $location ) {
-            print "Creating dependency $distribution";
+        my ($package_name) = grep /^\Q$distribution-\E[\d.]+/, keys %{ $self->{INDEX} };
+        my $location = $self->{INDEX}{$package_name}{path};
+        unless ($location) {
+            print "Creating dependency for $distribution";
+
             #die "Missing dependency for $distribution";
-            system( "$0 $module");
-            $location = '/usr/ports/' . LoadFile( glob "~/.portupload/$module.yml" )->{category} . "/$distribution"
+            unless (fork) {
+                my $a = App::Pm2Port->new( module => $module );
+                $a->run;
+                exit;
+            }
+            wait;
+            $location =
+                '/usr/ports/'
+              . LoadFile( glob "~/.portupload/$module.yml" )->{category}
+              . "/$distribution";
         }
         $location =~ s!/usr/ports!\${PORTSDIR}!;
         push @deps, "$distribution>=$requires->{$module}:$location";
@@ -129,7 +142,7 @@ Args: $metafile, $portupload_file, $man1, $man3
 =cut
 
 sub create_makefile {
-    my $self = shift;
+    my $self            = shift;
     my $file            = shift;
     my $portupload_file = shift;
     my $man1            = shift;
@@ -152,15 +165,15 @@ sub create_makefile {
     print $makefile "COMMENT=	$file->{abstract}\n";
     print $makefile "\n";
     print $makefile "BUILD_DEPENDS=	"
-      . get_dependencies( $file->{requires} )
-      . get_dependencies( $portupload_file->{requires}, 1 ) . "\n";
+      . $self->get_dependencies( $file->{requires} )
+      . $self->get_dependencies( $portupload_file->{requires}, 1 ) . "\n";
     print $makefile "RUN_DEPENDS=\${BUILD_DEPENDS}\n";
     print $makefile "\n";
     print $makefile "USE_APACHE=" . $portupload_file->{apache} . "\n"
       if $portupload_file->{apache};
     print $makefile "PERL_CONFIGURE=	"
       . (
-        $file->{requires}{perl}
+          $file->{requires}{perl}
         ? $self->perl_version_parse( $file->{requires}{perl} ) . "+"
         : 'YES'
       ) . "\n";
@@ -189,16 +202,22 @@ Creates config file for module
 sub create_config {
     my ( $self, $name ) = @_;
     mkdir glob "~/.portupload";
-    my $config = {};
-    $config->{category} = prompt( "Port category:", $self->suggest_category( $name ) );
-    my $maintainer_email;
+    my ($package_name) = grep /^\Qp5-$name-\E[\d.]+/, keys %{ $self->{INDEX} };
+    my $pkg_info       = $self->{INDEX}{$package_name};
+    my $config         = {};
+    my $suggested_category;
+    ( $config->{category}, $suggested_category ) =
+      $self->suggest_category( $name, $pkg_info->{categories} );
+    $config->{category} ||= prompt( "Port category:", $suggested_category );
+    my $maintainer_email = $pkg_info->{maintainer};
+
     if ( -e glob '~/.porttools' ) {
-        $maintainer_email = `. ~/.porttools;echo \$EMAIL`;
+        $maintainer_email ||= `. ~/.porttools;echo \$EMAIL`;
         chomp $maintainer_email;
     }
-    $config->{maintainer} = $maintainer_email||
-      prompt( "Maintainer email:", "$ENV{USER}\@rambler-co.ru" );
-    DumpFile( glob("~/.portupload/$ARGV[0].yml"), $config );
+    $config->{maintainer} = $maintainer_email
+      || prompt( "Maintainer email:", "$ENV{USER}\@rambler-co.ru" );
+    DumpFile( glob("~/.portupload/$self->{module}.yml"), $config );
 }
 
 =head2 run
@@ -208,7 +227,7 @@ Makes actually all work
 =cut
 
 sub run {
-    my ( $self ) = @_;
+    my ($self) = @_;
     my ( $post_on_cpan, $submit_to_freebsd );
 
     GetOptions(
@@ -235,17 +254,18 @@ qq{Usage: $0 [ --info ] [ --no-tests ] [ --no-upload ] [ --no-commit ] [ --cpan 
     );
 
     my $cpan = CPANPLUS::Backend->new;
-    my $module = $cpan->parse_module( module => $ARGV[0] );
+    my $module = $cpan->parse_module( module => $self->{module} );
     $module->fetch;
     chdir $module->extract;
 
     print ">>> Creating Makefile\n";
     $module->prepare;
     $module->test or die unless $ENV{NOTEST};
-    my $file    = LoadFile('META.yml');
+    my $file    = $self->load_meta;
     my $version = $file->{version};
-    $self->create_config($file->{name}) unless -f glob "~/.portupload/$ARGV[0].yml";
-    my $portupload_file = LoadFile( glob "~/.portupload/$ARGV[0].yml" );
+    $self->create_config( $file->{name} )
+      unless -f glob "~/.portupload/$self->{module}.yml";
+    my $portupload_file = LoadFile( glob "~/.portupload/$self->{module}.yml" );
     my $ftp;
     printf qq{
     Tests:  %s
@@ -256,7 +276,6 @@ qq{Usage: $0 [ --info ] [ --no-tests ] [ --no-upload ] [ --no-commit ] [ --cpan 
       ;
     exit if $ENV{INFO_ONLY};
 
-
     my $man1 = join " \\\n\t\t", map { s{blib/man1/}{}; $_ } glob 'blib/man1/*';
     my $man3 = join " \\\n\t\t", map { s{blib/man3/}{}; $_ } glob 'blib/man3/*';
     my @pkg_plist = grep !/.exists$/, `find blib/lib -type f`;
@@ -264,15 +283,17 @@ qq{Usage: $0 [ --info ] [ --no-tests ] [ --no-upload ] [ --no-commit ] [ --cpan 
     push @pkg_plist,
       '%%SITE_PERL%%/%%PERL_ARCH%%/auto/' . $dist_path . '/.packlist' . "\n";
     push @pkg_plist, ( grep !/.exists$/, `find blib/script -type f` );
-    push @pkg_plist, map { "\@dirrmtry $_" } reverse `find blib/lib -type d`;
-    push @pkg_plist, map { "\@dirrmtry $_" } reverse `find blib/arch -type d`;
+    push @pkg_plist,
+      map { "\@dirrmtry $_" } grep { $_ } reverse `find blib/lib -type d`;
+    push @pkg_plist,
+      map { "\@dirrmtry $_" } grep { $_ } reverse `find blib/arch -type d`;
     push @pkg_plist, map { "\@dirrmtry $_" } reverse `find blib/script -type d`;
     @pkg_plist = map { $_ =~ s{blib/lib}{\%\%SITE_PERL\%\%}; $_ } @pkg_plist;
     @pkg_plist =
       map { $_ =~ s{blib/arch}{\%\%SITE_PERL\%\%/\%\%PERL_ARCH\%\%}; $_ }
       @pkg_plist;
     @pkg_plist = map { $_ =~ s{blib/script/}{bin/}; $_ } @pkg_plist;
-    system("make -s clean") and die $?;
+    system("make -s clean");
     chdir tempdir();
 
     if (
@@ -328,20 +349,36 @@ Tries to find category for module name.
 =cut
 
 sub suggest_category {
-    my $self = shift;
+    my $self   = shift;
     my $module = shift;
-    my ( $root ) = split /-/, $module;
-    given ( $root ) {
-        when ( /^DBI(x)?|DBD$/ ) {
+    my ($root) = split /-/, $module;
+    my $categories = shift;
+    if ($categories) {
+        return grep !/^perl$/, @$categories;
+    }
+    given ($root) {
+        when (/^DBI(x)?|DBD$/) {
             return 'databases';
         }
-        when ( /^Catalyst|HTML|WWW$/ ) {
+        when (/^Catalyst|HTML|WWW$/) {
             return 'www';
         }
     }
-    return 'devel';
+    return undef, 'devel';
 }
 
+sub load_meta {
+    my $self = shift;
+    if ( -e 'META.json' ) {
+        open +( my $f ), '<', 'META.json' or die $!;
+        local $/ = undef;
+        local $\ = undef;
+        return JSON::XS::decode_json(<$f>);
+    }
+    else {
+        return LoadFile('META.yml');
+    }
+}
 1;
 
 __END__
