@@ -20,7 +20,7 @@ package App::Pm2Port;
 #===============================================================================
 
 $ENV{LC_ALL} = 'C';
-our $VERSION=0.25;
+our $VERSION=0.26;
 use 5.010;
 use feature qw(switch state);
 use strict;
