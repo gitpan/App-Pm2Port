@@ -20,7 +20,7 @@ package App::Pm2Port;
 #===============================================================================
 
 $ENV{LC_ALL} = 'C';
-our $VERSION=0.28;
+our $VERSION=0.29;
 use 5.010;
 use strict;
 use warnings;
@@ -151,6 +151,7 @@ sub create_makefile {
     my $portupload_file = shift;
     my $man1            = shift;
     my $man3            = shift;
+    my $module  = shift;
     open +( my $makefile ), '>', 'Makefile';
     ( my $comment = $file->{abstract} ) =~ s/\.$//;
     $comment = ucfirst $comment;
@@ -176,7 +177,7 @@ sub create_makefile {
     print $makefile "\n";
     print $makefile "USE_APACHE=" . $portupload_file->{apache} . "\n"
       if $portupload_file->{apache};
-    print $makefile "PERL_MODBUILD=	YES" if -e 'Build.PL';
+    print $makefile "PERL_MODBUILD=	YES\n" if $module->get_installer_type =~ /build/i;
     print $makefile "PERL_CONFIGURE=	"
       . (
           $file->{requires}{perl}
@@ -297,7 +298,7 @@ qq{Usage: $0 [ --info ] [ --no-tests ] [ --no-upload ] [ --no-commit ] [ --cpan 
           }
     }
 
-    $self->create_makefile( $file, $portupload_file, $man1, $man3 );
+    $self->create_makefile( $file, $portupload_file, $man1, $man3, $module );
     open PLIST, '>', 'pkg-plist';
     if ( !$portupload_file->{distfiles} ) {
         print PLIST @pkg_plist;
@@ -335,7 +336,7 @@ created list of manpages and pg-plist
 =cut
 
 sub generate_plist {
-    my ($self, $packlist ) = @_;
+    my ($self, $packlist, $module ) = @_;
     my @files = sort keys %$packlist;
     my (@man1, @man3, @plist, @dlist);
     foreach ( @files ) {
@@ -358,10 +359,12 @@ sub generate_plist {
         }
         die $_;
     }
-    my $packlist_file = $packlist->packlist_file();
-    $packlist_file =~ s/$Config{installsitelib}/\%\%SITE_PERL\%\%\/\%\%PERL_ARCH\%\%/;
-    push @dlist, $self->_get_dlist( $packlist_file , '%%SITE_PERL%%/%%PERL_ARCH%%/auto' );
-    push @plist, $packlist_file . "\n";
+    unless ($module->get_installer_type =~ /build/i) {
+        my $packlist_file = $packlist->packlist_file();
+        $packlist_file =~ s/$Config{installsitelib}/\%\%SITE_PERL\%\%\/\%\%PERL_ARCH\%\%/;
+        push @dlist, $self->_get_dlist( $packlist_file , '%%SITE_PERL%%/%%PERL_ARCH%%/auto' );
+        push @plist, $packlist_file . "\n";
+    }
     my $man1 = join "\\\n\t\t", @man1;
     my $man3 = join "\\\n\t\t", @man3;
     my %dlist = map { $_ => 1 } @dlist;
